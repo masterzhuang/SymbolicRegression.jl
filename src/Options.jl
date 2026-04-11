@@ -98,6 +98,43 @@ end
     end
 end
 
+# ── ASOUL QD archive: env-var bridge for Options(...) defaults ──
+# These helpers are deliberately inlined into OptionsModule (rather
+# than imported from QDArchiveModule) because QDArchive.jl is included
+# after Options.jl in src/SymbolicRegression.jl (it depends on
+# HallOfFame / PopMember / CheckConstraints / Complexity, all of
+# which load later). The parsing contract is identical to
+# QDArchive.qd_options_from_env; the two copies must stay in sync,
+# and the authoritative spec is documented in
+# fork_staging/symbolicregression_jl_asoul_qd_v1/README.md.
+
+function _qd_env_bool(name::AbstractString, default::Bool)::Bool
+    raw = get(ENV, name, nothing)
+    raw === nothing && return default
+    s = lowercase(strip(raw))
+    return s in ("1", "true", "yes", "on", "t", "y")
+end
+
+function _qd_env_int(name::AbstractString, default::Int)::Int
+    raw = get(ENV, name, nothing)
+    raw === nothing && return default
+    try
+        return parse(Int, strip(raw))
+    catch
+        @warn "OptionsModule: ignoring malformed $name=$raw; falling back to $default"
+        return default
+    end
+end
+
+function _resolve_qd_options_from_env()
+    return (
+        use_qd_archive = _qd_env_bool("ASOUL_USE_QD_ARCHIVE", false),
+        qd_migration   = _qd_env_bool("ASOUL_QD_MIGRATION",   true),
+        qd_migration_k = _qd_env_int("ASOUL_QD_MIGRATION_K",  16),
+        qd_max_cells   = _qd_env_int("ASOUL_QD_MAX_CELLS",    4096),
+    )
+end
+
 @unstable function build_nested_constraints(;
     nested_constraints, @nospecialize(operators_by_degree)
 )
@@ -656,6 +693,15 @@ $(OPTION_DESCRIPTIONS)
     use_recorder::Bool=false,
     recorder_file::AbstractString="pysr_recorder.json",
     popmember_type::Type=default_popmember_type(),
+    # ── ASOUL QD archive kwargs (asoul-qd-v1) ───────────────────────
+    # Defaults come from the env-var bridge (_resolve_qd_options_from_env
+    # below) so that Python can flip them without a PySR kwarg-whitelist
+    # round-trip. Passing `nothing` (the default) accepts the env-var
+    # value; passing an explicit Bool/Int overrides it.
+    use_qd_archive::Union{Bool,Nothing}=nothing,
+    qd_migration::Union{Bool,Nothing}=nothing,
+    qd_migration_k::Union{Integer,Nothing}=nothing,
+    qd_max_cells::Union{Integer,Nothing}=nothing,
     ### Not search options; just construction options:
     define_helper_functions::Bool=true,
     #########################################
@@ -673,6 +719,26 @@ $(OPTION_DESCRIPTIONS)
     kws...,
     #########################################
 )
+    # ── ASOUL QD archive: resolve defaults from env vars ──
+    # The PySR Python whitelist cannot forward new Julia Options kwargs,
+    # so the Python side sets ASOUL_QD_* env vars before fit() and the
+    # Julia side reads them here. Explicit kwargs (use_qd_archive=true,
+    # etc.) still win over env vars. Leaving everything unset reproduces
+    # upstream behaviour byte-for-byte. We assign directly to the outer
+    # function-local kwarg variables (no `let` block) so Julia's
+    # let-scope binding rules cannot accidentally shadow the outer
+    # names — the four kwargs must be ordinary function locals by the
+    # time the Options(...) struct call at the bottom reads them.
+    _qd_env = _resolve_qd_options_from_env()
+    use_qd_archive === nothing && (use_qd_archive = _qd_env.use_qd_archive)
+    qd_migration   === nothing && (qd_migration   = _qd_env.qd_migration)
+    qd_migration_k === nothing && (qd_migration_k = _qd_env.qd_migration_k)
+    qd_max_cells   === nothing && (qd_max_cells   = _qd_env.qd_max_cells)
+    use_qd_archive = Bool(use_qd_archive)
+    qd_migration   = Bool(qd_migration)
+    qd_migration_k = Int(qd_migration_k)
+    qd_max_cells   = Int(qd_max_cells)
+
     for k in keys(kws)
         !haskey(deprecated_options_mapping, k) && error("Unknown keyword argument: $k")
         new_key = deprecated_options_mapping[k]
@@ -1110,6 +1176,11 @@ $(OPTION_DESCRIPTIONS)
         define_helper_functions,
         use_recorder,
         popmember_type,
+        # ── ASOUL QD archive (asoul-qd-v1) ──
+        use_qd_archive,
+        qd_migration,
+        qd_migration_k,
+        qd_max_cells,
     )
 
     return options

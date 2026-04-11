@@ -258,6 +258,16 @@ struct Options{
     define_helper_functions::Bool
     use_recorder::Bool
     popmember_type::Type{PM}
+    # ── ASOUL QD archive fields (asoul-qd-v1) ─────────────────────────
+    # Added by the search-time MAP-Elites quality-diversity fork.
+    # All four default to upstream-compatible values (see Options.jl
+    # constructor). An Options(...) built with default kwargs is
+    # byte-identical to upstream. See src/QDArchive.jl for the
+    # semantic contract.
+    use_qd_archive::Bool
+    qd_migration::Bool
+    qd_migration_k::Int
+    qd_max_cells::Int
 end
 
 function Base.print(io::IO, @nospecialize(options::Options))
