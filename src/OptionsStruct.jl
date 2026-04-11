@@ -258,6 +258,17 @@ struct Options{
     deterministic::Bool
     define_helper_functions::Bool
     use_recorder::Bool
+    # ── ASOUL QD archive fields (asoul-qd-v1-on-1.11) ─────────────────
+    # Added by the search-time MAP-Elites quality-diversity fork.
+    # All four default to upstream-compatible values (see Options.jl
+    # constructor). An Options(...) built with default kwargs is
+    # byte-identical to upstream. See src/QDArchive.jl for the
+    # semantic contract. Applied against upstream SymbolicRegression.jl
+    # v1.11.3 (c3a974d8dfebf3ead2413fc670d9b86ef4a1c414).
+    use_qd_archive::Bool
+    qd_migration::Bool
+    qd_migration_k::Int
+    qd_max_cells::Int
 end
 
 function Base.print(io::IO, @nospecialize(options::Options))

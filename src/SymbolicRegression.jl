@@ -219,6 +219,7 @@ using DispatchDoctor: @stable
     include("ConstantOptimization.jl")
     include("Population.jl")
     include("HallOfFame.jl")
+    include("QDArchive.jl")  # ASOUL asoul-qd-v1-on-1.11: MAP-Elites archive
     include("Mutate.jl")
     include("RegularizedEvolution.jl")
     include("SingleIteration.jl")
@@ -304,6 +305,13 @@ using .PopMemberModule: PopMember, reset_birth!
 using .PopulationModule: Population, best_sub_pop, record_population, best_of_sample
 using .HallOfFameModule:
     HallOfFame, calculate_pareto_frontier, string_dominating_pareto_curve
+# ── ASOUL asoul-qd-v1-on-1.11: MAP-Elites archive for search-time QD ──
+using .QDArchiveModule:
+    QDArchive,
+    update_qd_archive!,
+    sample_qd_archive,
+    compress_to_hall_of_fame!,
+    qd_archive_stats
 using .MutateModule: mutate!, condition_mutation_weights!, MutationResult
 using .SingleIterationModule: s_r_cycle, optimize_and_simplify_population
 using .ProgressBarsModule: WrappedProgressBar
@@ -834,6 +842,18 @@ function _main_search_loop!(
         nothing
     end
 
+    # ── ASOUL asoul-qd-v1-on-1.11: per-output MAP-Elites archive allocation ──
+    # Local to _main_search_loop! so we do not touch the SearchState
+    # struct. `qd_archives === nothing` is the rollback sentinel every
+    # downstream call site guards against; with options.use_qd_archive
+    # == false, the rest of this function is byte-identical to upstream.
+    qd_archives = if options.use_qd_archive
+        _PM_QD = eltype(state.halls_of_fame[1].members)
+        [QDArchive(_PM_QD; max_cells=options.qd_max_cells) for _ in 1:nout]
+    else
+        nothing
+    end
+
     last_print_time = time()
     last_speed_recording_time = time()
     num_evals_last = sum(sum, state.num_evals)
@@ -911,6 +931,11 @@ function _main_search_loop!(
             #! format: off
             update_hall_of_fame!(state.halls_of_fame[j], cur_pop.members, options)
             update_hall_of_fame!(state.halls_of_fame[j], best_seen.members[best_seen.exists], options)
+            # ── ASOUL asoul-qd-v1-on-1.11: parallel QD archive update ──
+            if qd_archives !== nothing
+                update_qd_archive!(qd_archives[j], cur_pop.members, options)
+                update_qd_archive!(qd_archives[j], best_seen.members[best_seen.exists], options)
+            end
             #! format: on
 
             # Dominating pareto curve - must be better than all simpler equations
@@ -930,7 +955,18 @@ function _main_search_loop!(
                 )
             end
             if options.hof_migration && length(dominating) > 0
-                migrate!(dominating => cur_pop, options; frac=options.fraction_replaced_hof)
+                # ── ASOUL asoul-qd-v1-on-1.11: diversity-biased migration source ──
+                # With QD enabled, sample migrants uniformly across archive
+                # cells instead of from the parsimony-collapsed Pareto
+                # dominating set. Falls back to `dominating` if the archive
+                # is still empty (first few cycles) or QD is disabled.
+                _qd_source = if qd_archives !== nothing && options.qd_migration
+                    _tmp = sample_qd_archive(qd_archives[j], options.qd_migration_k)
+                    isempty(_tmp) ? dominating : _tmp
+                else
+                    dominating
+                end
+                migrate!(_qd_source => cur_pop, options; frac=options.fraction_replaced_hof)
             end
             ###################################################################
 
