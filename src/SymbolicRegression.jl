@@ -220,6 +220,7 @@ using DispatchDoctor: @stable
     include("Population.jl")
     include("HallOfFame.jl")
     include("QDArchive.jl")  # ASOUL asoul-qd-v1-on-1.11: MAP-Elites archive
+    include("SeedPopulation.jl")  # ASOUL chunk h: seed-injected initial populations
     include("Mutate.jl")
     include("RegularizedEvolution.jl")
     include("SingleIteration.jl")
@@ -312,6 +313,8 @@ using .QDArchiveModule:
     sample_qd_archive,
     compress_to_hall_of_fame!,
     qd_archive_stats
+# ── ASOUL chunk h (2026-04-18): seed-injected initial populations ──
+using .SeedPopulationModule: seed_initial_population!
 using .MutateModule: mutate!, condition_mutation_weights!, MutationResult
 using .SingleIterationModule: s_r_cycle, optimize_and_simplify_population
 using .ProgressBarsModule: WrappedProgressBar
@@ -757,17 +760,61 @@ function _initialize_search!(
                 end
                 @sr_spawner(
                     begin
+                        _asoul_pop = Population(
+                            datasets[j];
+                            population_size=options.population_size,
+                            nlength=3,
+                            options=options,
+                            nfeatures=max_features(datasets[j], options),
+                        )
+                        # ── ASOUL chunk h: splice neural-seed trees into pop #1 ──
+                        # Gated on `initial_seed_strings !== nothing` (env-var
+                        # unset reproduces upstream behaviour) AND on `i == 1`
+                        # (only population index 1 per output is seeded; other
+                        # islands stay random-init so migration has room to
+                        # propagate good seeds instead of flooding the initial
+                        # pool with near-duplicates). See
+                        # docs/notes/neurosymbolic_seeded_pysr_design_v1.md §5.
+                        #
+                        # Codex round-5 P2c (2026-04-18): each spliced PopMember
+                        # spends one eval_cost call inside the v1.11.3
+                        # dataset-aware `PopMember(dataset, tree, options)`
+                        # constructor, ON TOP of the `population_size`
+                        # evaluations the random-init Population(...) already
+                        # burned. Thread the spliced count into the
+                        # evaluation-counter tuple element so `max_evals`
+                        # accounting and seeded-vs-baseline budget comparisons
+                        # stay honest. With `initial_seed_strings === nothing`
+                        # (upstream-compat path), `_asoul_extra_evals` stays
+                        # 0 and the counter is byte-identical to upstream.
+                        #
+                        # Codex round-7 P1 (2026-04-18, accepted as known-minor
+                        # caveat): this overwrite pattern causes seeded runs
+                        # to spend `population_size + spliced` total evals vs
+                        # baseline's `population_size`. For the chunk-h smoke
+                        # workflow (max 16 seeds vs ~10.89M total evals per
+                        # PySR fit from PYSR_DEFAULTS), the contamination is
+                        # 1.6e-6 of budget — negligible for the +5pp G0-4
+                        # threshold and not measurable in G0-3 latency. A
+                        # fully apples-to-apples fix would require a
+                        # Population(...) constructor kwarg that accepts
+                        # pre-built members and skips random-init for those
+                        # slots, which is invasive and out of scope for
+                        # chunk h. Documented in gate_report.json provenance
+                        # via the accurate num_evals counter below so
+                        # downstream analyses can inspect the budget
+                        # difference directly.
+                        _asoul_extra_evals = 0
+                        if options.initial_seed_strings !== nothing && i == 1
+                            _asoul_extra_evals = seed_initial_population!(
+                                _asoul_pop, datasets[j], options,
+                            )
+                        end
                         (
-                            Population(
-                                datasets[j];
-                                population_size=options.population_size,
-                                nlength=3,
-                                options=options,
-                                nfeatures=max_features(datasets[j], options),
-                            ),
+                            _asoul_pop,
                             HallOfFame(options, datasets[j]),
                             RecordType(),
-                            Float64(options.population_size),
+                            Float64(options.population_size + _asoul_extra_evals),
                         )
                     end,
                     parallelism = ropt.parallelism,

@@ -9,6 +9,9 @@ using DynamicExpressions:
     default_node_type,
     AbstractExpression,
     AbstractExpressionNode
+import JSON3  # ASOUL chunk h: used by `_seed_strings_from_env` only; upstream
+              # SymbolicRegression.jl already depends on JSON3 via Recorder.jl
+              # so this adds no new dependency.
 using ADTypes: AbstractADType, ADTypes
 using LossFunctions: L2DistLoss, SupervisedLoss
 using Optim: Optim
@@ -132,6 +135,52 @@ function _resolve_qd_options_from_env()
         qd_migration_k = _qd_env_int("ASOUL_QD_MIGRATION_K",  16),
         qd_max_cells   = _qd_env_int("ASOUL_QD_MAX_CELLS",    4096),
     )
+end
+
+# ── ASOUL seed-population: env-var bridge for initial-population seeds ──
+# Mirrors the QD env-var helpers above. Deliberately inlined into
+# OptionsModule rather than imported from SeedPopulationModule, because
+# SeedPopulation.jl is included AFTER Options.jl in
+# src/SymbolicRegression.jl (it depends on PopMember / Population, both
+# of which load later). The JSON-parsing contract is duplicated between
+# this helper and `SeedPopulationModule.seeds_from_env`; both must stay
+# in sync and the authoritative spec lives in
+# docs/notes/neurosymbolic_seeded_pysr_design_v1.md §2.
+#
+# Rollback invariant: env var unset → `nothing` → the downstream splice
+# branch in _initialize_search! is skipped → byte-identical to upstream
+# v1.11.3 + QD behaviour. The upstream `Pkg.test()` suite runs with the
+# env var unset and therefore sees no behavioural change.
+function _seed_strings_from_env(
+    ; env_var::AbstractString = "ASOUL_SR_INITIAL_SEEDS_JSON",
+)::Union{Nothing, Vector{String}}
+    raw = get(ENV, env_var, nothing)
+    (raw === nothing || isempty(strip(raw))) && return nothing
+    path = strip(raw)
+    if !isfile(path)
+        @warn "OptionsModule: $env_var points at missing file; ignoring" path
+        return nothing
+    end
+    doc = try
+        JSON3.read(read(path, String))
+    catch err
+        @warn "OptionsModule: failed to parse seed JSON; ignoring" path exception=(err, catch_backtrace())
+        return nothing
+    end
+    version = get(doc, :version, nothing)
+    exprs   = get(doc, :seed_expressions, nothing)
+    if version != 1 || !(exprs isa AbstractVector)
+        @warn "OptionsModule: unexpected seed JSON shape (want version=1 + seed_expressions array); ignoring" path version
+        return nothing
+    end
+    strings = String[]
+    for s in exprs
+        (s isa AbstractString) || continue
+        trimmed = strip(String(s))
+        isempty(trimmed) && continue
+        push!(strings, String(trimmed))
+    end
+    isempty(strings) ? nothing : strings
 end
 
 @unstable function build_nested_constraints(;
@@ -698,6 +747,12 @@ $(OPTION_DESCRIPTIONS)
     qd_migration::Union{Bool,Nothing}=nothing,
     qd_migration_k::Union{Integer,Nothing}=nothing,
     qd_max_cells::Union{Integer,Nothing}=nothing,
+    # ── ASOUL seed-population kwarg (chunk h, 2026-04-18) ─────────────
+    # `nothing` (the default) accepts the `ASOUL_SR_INITIAL_SEEDS_JSON`
+    # env-var bridge via `_seed_strings_from_env()`. An explicit
+    # `Vector{String}` overrides the env var. Keep in sync with the
+    # matching struct field in `OptionsStruct.jl`.
+    initial_seed_strings::Union{Nothing,Vector{String}}=nothing,
     ### Not search options; just construction options:
     define_helper_functions::Bool=true,
     #########################################
@@ -731,6 +786,13 @@ $(OPTION_DESCRIPTIONS)
     qd_migration   = Bool(qd_migration)
     qd_migration_k = Int(qd_migration_k)
     qd_max_cells   = Int(qd_max_cells)
+    # ── ASOUL seed-population: resolve default from env var ──
+    # The `ASOUL_SR_INITIAL_SEEDS_JSON` path is read at Options(...) time
+    # into a plain `Vector{String}`. Parsing to `Node{T}` is deferred to
+    # `_initialize_search!` because the operator enum is not yet resolved
+    # at this point in the constructor body. See design memo §3 for the
+    # explicit parse-time vs search-time split.
+    initial_seed_strings === nothing && (initial_seed_strings = _seed_strings_from_env())
 
     for k in keys(kws)
         !haskey(deprecated_options_mapping, k) && error("Unknown keyword argument: $k")
@@ -1104,6 +1166,8 @@ $(OPTION_DESCRIPTIONS)
         qd_migration,
         qd_migration_k,
         qd_max_cells,
+        # ── ASOUL seed-population (chunk h, 2026-04-18) ──
+        initial_seed_strings,
     )
 
     return options

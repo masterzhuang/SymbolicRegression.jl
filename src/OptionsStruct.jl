@@ -269,6 +269,17 @@ struct Options{
     qd_migration::Bool
     qd_migration_k::Int
     qd_max_cells::Int
+    # ── ASOUL seed-population field (chunk h, 2026-04-18) ─────────────
+    # Holds the raw seed expression strings loaded from
+    # ENV["ASOUL_SR_INITIAL_SEEDS_JSON"] at Options(...) init, or
+    # `nothing` when the env var is unset. Parsing to `Node{T}` happens
+    # lazily inside _initialize_search! because operators aren't fully
+    # resolved at Options(...) body time. `nothing` reproduces upstream
+    # v1.11.3 + QD behaviour byte-for-byte — the splice branch in
+    # _initialize_search! is gated on `initial_seed_strings !== nothing`.
+    # See src/SeedPopulation.jl and
+    # docs/notes/neurosymbolic_seeded_pysr_design_v1.md (project-local).
+    initial_seed_strings::Union{Nothing, Vector{String}}
 end
 
 function Base.print(io::IO, @nospecialize(options::Options))
