@@ -236,6 +236,8 @@ function parse_seed_tree(
     catch
         return nothing
     end
+    # First pass: try the raw AST so non-PySR callers whose OperatorEnum
+    # carries plain `log` / `sqrt` continue to parse bit-identically.
     try
         return parse_expression(
             ast_expr;
@@ -245,8 +247,70 @@ function parse_seed_tree(
             node_type       = options.node_type,
         )
     catch
-        return nothing
+        # Second pass: PySR's `Options(unary_operators=["log","sqrt",...])`
+        # wraps the operators with domain-safe variants at enum
+        # construction time, so the OperatorEnum actually contains
+        # `safe_log` / `safe_sqrt` and `parse_expression` fails the
+        # raw `log(...)` / `sqrt(...)` call with
+        # `ArgumentError: Unrecognized operator: log with no matches
+        # in (safe_log, safe_sqrt)`. Codex Lane D0.1
+        # (task-mo63ae3u-cszznz, 2026-04-20) reproduced this exact
+        # error on the SB-02 oracle-truth seed string `X3 * log(X1 / X2)`.
+        # Alias the AST's `:log` / `:sqrt` call heads to `:safe_log` /
+        # `:safe_sqrt` and retry. If the enum does NOT carry the safe
+        # variants this retry fails the same way and we return nothing
+        # as before.
+        aliased = _alias_pysr_safe_ops(ast_expr)
+        try
+            return parse_expression(
+                aliased;
+                operators       = options.operators,
+                variable_names  = varnames,
+                expression_type = options.expression_type,
+                node_type       = options.node_type,
+            )
+        catch
+            return nothing
+        end
     end
+end
+
+"""
+    _alias_pysr_safe_ops(x)
+
+Return a new AST with every `:log(...)` call head rewritten to
+`:safe_log` and every `:sqrt(...)` call head rewritten to
+`:safe_sqrt`. Pure / non-mutating; walks the Julia AST recursively.
+
+Why this exists: PySR's `Options(unary_operators=["log", "sqrt"])`
+constructs an `OperatorEnum` whose actual callable symbols are the
+domain-safe wrappers (`SymbolicRegression.CoreModule.OperatorsModule.
+safe_log` / `safe_sqrt`) — a bare `log` / `sqrt` call in a seed
+string therefore fails `parse_expression`'s operator resolution with
+"Unrecognized operator: log with no matches in (safe_log, safe_sqrt)".
+Aliasing in the seed parser lets Python-emitted sympy strings
+(which never see the safe wrappers) resolve against a PySR-built
+enum. For non-PySR callers whose enum carries plain `log` / `sqrt`,
+the first-pass `parse_expression` in `parse_seed_tree` succeeds
+without ever reaching this function.
+
+No-op on anything other than `:call` heads for `:log` / `:sqrt`.
+In particular, symbols like `:X1`, numeric literals, and nested
+`log(log(X1))` forms are all handled correctly.
+"""
+function _alias_pysr_safe_ops(x)
+    if x isa Expr
+        new_args = Any[_alias_pysr_safe_ops(a) for a in x.args]
+        if x.head === :call && !isempty(new_args)
+            if new_args[1] === :log
+                new_args[1] = :safe_log
+            elseif new_args[1] === :sqrt
+                new_args[1] = :safe_sqrt
+            end
+        end
+        return Expr(x.head, new_args...)
+    end
+    return x
 end
 
 function _resolve_variable_names(dataset::Dataset{T, L}) where {T, L}
