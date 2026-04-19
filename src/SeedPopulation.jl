@@ -22,12 +22,33 @@
 module SeedPopulationModule
 
 using ..CoreModule: AbstractOptions, DATA_TYPE, LOSS_TYPE, Dataset
+using ..CoreModule.OperatorsModule: safe_log, safe_sqrt
 using ..PopMemberModule: PopMember
 using ..PopulationModule: Population
 using ..LossFunctionsModule: eval_cost
 using DynamicExpressions:
     AbstractExpression, AbstractExpressionNode, Node, parse_expression
 import JSON3
+
+# Rationale for the `using ..CoreModule.OperatorsModule: safe_log,
+# safe_sqrt` import above (Codex Lane D0.2 task-mo65g3b2-l8vv8t
+# diagnosis, 2026-04-20):
+#
+# PySR's `Options(unary_operators=["log","sqrt","inv(x)=1/x"])` wraps
+# `log` / `sqrt` with the domain-safe variants at enum construction
+# time, so the OperatorEnum's actual callable symbols are
+# `SymbolicRegression.CoreModule.OperatorsModule.safe_log` and
+# `safe_sqrt`. Python-emitted sympy seed strings carry bare `log(...)`
+# / `sqrt(...)`. The `_alias_pysr_safe_ops` walk below rewrites those
+# AST heads to `:safe_log` / `:safe_sqrt` — but `DynamicExpressions.
+# parse_expression` resolves the Symbol against its calling module's
+# scope FIRST (before matching the OperatorEnum), and without this
+# import `safe_log` is not a bound name in `SeedPopulationModule`'s
+# scope, so the aliased parse still fails with
+# `ArgumentError: Tried to interpolate function safe_log but failed`
+# (Codex Lane D0.1 exactly reproduced this error on a bare-name
+# seed string). The import binds the safe ops into this module so
+# the alias path resolves cleanly against both scope and enum.
 
 export SEEDS_ENV_VAR,
        seeds_from_env,
@@ -238,6 +259,7 @@ function parse_seed_tree(
     end
     # First pass: try the raw AST so non-PySR callers whose OperatorEnum
     # carries plain `log` / `sqrt` continue to parse bit-identically.
+    raw_err = nothing
     try
         return parse_expression(
             ast_expr;
@@ -246,32 +268,46 @@ function parse_seed_tree(
             expression_type = options.expression_type,
             node_type       = options.node_type,
         )
-    catch
-        # Second pass: PySR's `Options(unary_operators=["log","sqrt",...])`
-        # wraps the operators with domain-safe variants at enum
-        # construction time, so the OperatorEnum actually contains
-        # `safe_log` / `safe_sqrt` and `parse_expression` fails the
-        # raw `log(...)` / `sqrt(...)` call with
-        # `ArgumentError: Unrecognized operator: log with no matches
-        # in (safe_log, safe_sqrt)`. Codex Lane D0.1
-        # (task-mo63ae3u-cszznz, 2026-04-20) reproduced this exact
-        # error on the SB-02 oracle-truth seed string `X3 * log(X1 / X2)`.
-        # Alias the AST's `:log` / `:sqrt` call heads to `:safe_log` /
-        # `:safe_sqrt` and retry. If the enum does NOT carry the safe
-        # variants this retry fails the same way and we return nothing
-        # as before.
-        aliased = _alias_pysr_safe_ops(ast_expr)
-        try
-            return parse_expression(
-                aliased;
-                operators       = options.operators,
-                variable_names  = varnames,
-                expression_type = options.expression_type,
-                node_type       = options.node_type,
-            )
-        catch
-            return nothing
-        end
+    catch err_raw
+        raw_err = err_raw
+    end
+    # Second pass: PySR's `Options(unary_operators=["log","sqrt",...])`
+    # wraps the operators with domain-safe variants at enum
+    # construction time, so the OperatorEnum actually contains
+    # `safe_log` / `safe_sqrt` and `parse_expression` fails the
+    # raw `log(...)` / `sqrt(...)` call with
+    # `ArgumentError: Unrecognized operator: log with no matches
+    # in (safe_log, safe_sqrt)`. Codex Lane D0.1
+    # (task-mo63ae3u-cszznz, 2026-04-20) reproduced this exact
+    # error on the SB-02 oracle-truth seed string `X3 * log(X1 / X2)`.
+    # Alias the AST's `:log` / `:sqrt` call heads to `:safe_log` /
+    # `:safe_sqrt` and retry. If the enum does NOT carry the safe
+    # variants this retry fails the same way and we return nothing
+    # as before.
+    aliased = _alias_pysr_safe_ops(ast_expr)
+    try
+        return parse_expression(
+            aliased;
+            operators       = options.operators,
+            variable_names  = varnames,
+            expression_type = options.expression_type,
+            node_type       = options.node_type,
+        )
+    catch aliased_err
+        # Diagnostic: emit both errors so operators can see WHY the
+        # retry path failed (e.g. aliased name still unresolved, or
+        # parse_expression expects something other than a bare Symbol).
+        # Codex Lane D0.2 task-mo65g3b2-l8vv8t on 2026-04-20 showed
+        # that even with `_alias_pysr_safe_ops` active, production
+        # PySR-built OperatorEnum rejected the aliased AST; without
+        # this logging we cannot tell whether the rejection is a
+        # Symbol-vs-callable mismatch, a fully-qualified-name
+        # requirement, or an expression-type incompatibility.
+        @warn (
+            "SeedPopulation: parse_seed_tree both raw and aliased " *
+            "parses failed; falling back (seed dropped)"
+        ) seed_str raw_err aliased_err
+        return nothing
     end
 end
 
