@@ -257,6 +257,33 @@ function parse_seed_tree(
     catch
         return nothing
     end
+    # Assemble an `evaluate_on` tuple with every binary + unary op
+    # actually registered in the OperatorEnum. `DynamicExpressions.
+    # parse_expression` uses this kwarg to resolve AST function
+    # Symbols that aren't found via the enum's `nameof`-based match
+    # (the scope/interpolation fallback). Without this, Python-
+    # emitted seeds fail with
+    #   - `Unrecognized operator: log with no matches in (safe_log,
+    #     safe_sqrt, inv)` when the bare `:log` Symbol doesn't match
+    #     the enum's `nameof`-keyed table, OR
+    #   - `Tried to interpolate function safe_log but failed` when
+    #     the aliased `:safe_log` Symbol matches the enum by name
+    #     but parse_expression's interpolation context cannot find
+    #     the function itself (as Codex Lane D0.3 task-mo67bmsa-
+    #     lozpgt reproduced on 2026-04-20 even after adding the
+    #     `using ..OperatorsModule: safe_log, safe_sqrt` import to
+    #     this module).
+    # Passing the actual function objects via `evaluate_on` is the
+    # escape hatch the raw-pass error message itself suggests.
+    evaluate_on = try
+        ops = options.operators
+        # ops.unaops / ops.binops are function tuples on
+        # DynamicExpressions.OperatorEnum. Concat both so the evaluator
+        # has every registered op available.
+        (ops.binops..., ops.unaops...)
+    catch
+        ()
+    end
     # First pass: try the raw AST so non-PySR callers whose OperatorEnum
     # carries plain `log` / `sqrt` continue to parse bit-identically.
     raw_err = nothing
@@ -267,6 +294,7 @@ function parse_seed_tree(
             variable_names  = varnames,
             expression_type = options.expression_type,
             node_type       = options.node_type,
+            evaluate_on     = evaluate_on,
         )
     catch err_raw
         raw_err = err_raw
@@ -292,6 +320,7 @@ function parse_seed_tree(
             variable_names  = varnames,
             expression_type = options.expression_type,
             node_type       = options.node_type,
+            evaluate_on     = evaluate_on,
         )
     catch aliased_err
         # Diagnostic: emit both errors so operators can see WHY the
@@ -306,7 +335,7 @@ function parse_seed_tree(
         @warn (
             "SeedPopulation: parse_seed_tree both raw and aliased " *
             "parses failed; falling back (seed dropped)"
-        ) seed_str raw_err aliased_err
+        ) seed_str raw_err aliased_err evaluate_on_n=length(evaluate_on)
         return nothing
     end
 end
