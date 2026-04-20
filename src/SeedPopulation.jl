@@ -31,24 +31,42 @@ using DynamicExpressions:
 import JSON3
 
 # Rationale for the `using ..CoreModule.OperatorsModule: safe_log,
-# safe_sqrt` import above (Codex Lane D0.2 task-mo65g3b2-l8vv8t
-# diagnosis, 2026-04-20):
+# safe_sqrt` import above + the `_alias_pysr_safe_ops` rewrite below
+# (Codex Lane D0.R task-mo6kbwnf-9081c9 research, 2026-04-20):
 #
 # PySR's `Options(unary_operators=["log","sqrt","inv(x)=1/x"])` wraps
-# `log` / `sqrt` with the domain-safe variants at enum construction
-# time, so the OperatorEnum's actual callable symbols are
-# `SymbolicRegression.CoreModule.OperatorsModule.safe_log` and
-# `safe_sqrt`. Python-emitted sympy seed strings carry bare `log(...)`
-# / `sqrt(...)`. The `_alias_pysr_safe_ops` walk below rewrites those
-# AST heads to `:safe_log` / `:safe_sqrt` — but `DynamicExpressions.
-# parse_expression` resolves the Symbol against its calling module's
-# scope FIRST (before matching the OperatorEnum), and without this
-# import `safe_log` is not a bound name in `SeedPopulationModule`'s
-# scope, so the aliased parse still fails with
-# `ArgumentError: Tried to interpolate function safe_log but failed`
-# (Codex Lane D0.1 exactly reproduced this error on a bare-name
-# seed string). The import binds the safe ops into this module so
-# the alias path resolves cleanly against both scope and enum.
+# `log` / `sqrt` with domain-safe variants at enum construction time,
+# so the OperatorEnum's actual callable symbols are `safe_log` /
+# `safe_sqrt` (and a custom `inv`). Python-emitted sympy seed strings
+# carry bare `log(...)` / `sqrt(...)` calls.
+#
+# The root cause, read from `DynamicExpressions/src/Parse.jl:265-269`:
+# `parse_expression` resolves an `Expr(:call, callee, args...)`
+# callee via `Core.eval(EmptyModule, callee)`. `EmptyModule` is a
+# module with no top-level bindings, so bare `:log` / `:safe_log`
+# Symbol lookups ALL fail before `evaluate_on` is consulted — no
+# caller-module import, no `evaluate_on` vector, no `using`
+# statement rescues this path.
+#
+# Lane D0.R verified on live PySR `opts + dataset`: rewriting the
+# callee position of each `Expr(:call, ...)` to a `GlobalRef(Module,
+# :name)` skips the EmptyModule evaluation entirely, because
+# `GlobalRef` is a direct binding reference. The successful Julia
+# snippet (A10) was:
+#     ex = Meta.parse("X3*log(X1/X2)")
+#     ex.args[3].args[1] = GlobalRef(SymbolicRegression, :safe_log)
+#     parse_expression(ex; operators=opts.operators, ...)
+# → `max_abs_err = 5.96e-8` on 30-sample evaluation vs the Python-
+# computed target (machine epsilon for Float32).
+#
+# `_alias_pysr_safe_ops` below implements this: walk the AST and
+# replace each `:log` / `:sqrt` call head with a `GlobalRef` to the
+# safe-op binding in the parent SymbolicRegression module. `:inv`
+# is left as-is for now because PySR's `inv(x) = 1/x` is often an
+# anonymous binding outside SymbolicRegression's exports, so the
+# right GlobalRef target is environment-dependent; the instrumented
+# @warn surfaces any residual failure if a seed using `:inv` shows
+# up in practice.
 
 export SEEDS_ENV_VAR,
        seeds_from_env,
@@ -257,42 +275,11 @@ function parse_seed_tree(
     catch
         return nothing
     end
-    # Assemble an `evaluate_on` tuple with every binary + unary op
-    # actually registered in the OperatorEnum. `DynamicExpressions.
-    # parse_expression` uses this kwarg to resolve AST function
-    # Symbols that aren't found via the enum's `nameof`-based match
-    # (the scope/interpolation fallback). Without this, Python-
-    # emitted seeds fail with
-    #   - `Unrecognized operator: log with no matches in (safe_log,
-    #     safe_sqrt, inv)` when the bare `:log` Symbol doesn't match
-    #     the enum's `nameof`-keyed table, OR
-    #   - `Tried to interpolate function safe_log but failed` when
-    #     the aliased `:safe_log` Symbol matches the enum by name
-    #     but parse_expression's interpolation context cannot find
-    #     the function itself (as Codex Lane D0.3 task-mo67bmsa-
-    #     lozpgt reproduced on 2026-04-20 even after adding the
-    #     `using ..OperatorsModule: safe_log, safe_sqrt` import to
-    #     this module).
-    # Passing the actual function objects via `evaluate_on` is the
-    # escape hatch the raw-pass error message itself suggests.
-    evaluate_on = try
-        ops = options.operators
-        # ops.unaops / ops.binops are function tuples on
-        # DynamicExpressions.OperatorEnum. Concat both into a
-        # `Vector` so the evaluator has every registered op
-        # available. `parse_expression` enforces
-        # `evaluate_on::Union{Nothing, AbstractVector}` and rejects
-        # a bare `Tuple` with `TypeError: in keyword argument
-        # evaluate_on, expected Union{Nothing, AbstractVector},
-        # got a value of type Tuple{...}` — Codex Lane D0.4
-        # task-mo6fn1a6-5w6h01 (2026-04-20) reproduced this exact
-        # type error on the first evaluate_on attempt.
-        Any[ops.binops..., ops.unaops...]
-    catch
-        Any[]
-    end
-    # First pass: try the raw AST so non-PySR callers whose OperatorEnum
-    # carries plain `log` / `sqrt` continue to parse bit-identically.
+    # First pass: try the raw AST so non-PySR callers whose
+    # OperatorEnum carries plain `log` / `sqrt` (whose bare
+    # Symbol callees happen to resolve in EmptyModule because
+    # they map to Base functions) continue to parse bit-
+    # identically with upstream.
     raw_err = nothing
     try
         return parse_expression(
@@ -301,24 +288,14 @@ function parse_seed_tree(
             variable_names  = varnames,
             expression_type = options.expression_type,
             node_type       = options.node_type,
-            evaluate_on     = evaluate_on,
         )
     catch err_raw
         raw_err = err_raw
     end
-    # Second pass: PySR's `Options(unary_operators=["log","sqrt",...])`
-    # wraps the operators with domain-safe variants at enum
-    # construction time, so the OperatorEnum actually contains
-    # `safe_log` / `safe_sqrt` and `parse_expression` fails the
-    # raw `log(...)` / `sqrt(...)` call with
-    # `ArgumentError: Unrecognized operator: log with no matches
-    # in (safe_log, safe_sqrt)`. Codex Lane D0.1
-    # (task-mo63ae3u-cszznz, 2026-04-20) reproduced this exact
-    # error on the SB-02 oracle-truth seed string `X3 * log(X1 / X2)`.
-    # Alias the AST's `:log` / `:sqrt` call heads to `:safe_log` /
-    # `:safe_sqrt` and retry. If the enum does NOT carry the safe
-    # variants this retry fails the same way and we return nothing
-    # as before.
+    # Second pass: rewrite safe-op callees to GlobalRef before
+    # parse_expression sees them. See the big comment near the top
+    # of this module + Codex Lane D0.R task-mo6kbwnf-9081c9
+    # verification (max_abs_err 5.96e-8 on live PySR opts).
     aliased = _alias_pysr_safe_ops(ast_expr)
     try
         return parse_expression(
@@ -327,22 +304,19 @@ function parse_seed_tree(
             variable_names  = varnames,
             expression_type = options.expression_type,
             node_type       = options.node_type,
-            evaluate_on     = evaluate_on,
         )
     catch aliased_err
-        # Diagnostic: emit both errors so operators can see WHY the
-        # retry path failed (e.g. aliased name still unresolved, or
-        # parse_expression expects something other than a bare Symbol).
-        # Codex Lane D0.2 task-mo65g3b2-l8vv8t on 2026-04-20 showed
-        # that even with `_alias_pysr_safe_ops` active, production
-        # PySR-built OperatorEnum rejected the aliased AST; without
-        # this logging we cannot tell whether the rejection is a
-        # Symbol-vs-callable mismatch, a fully-qualified-name
-        # requirement, or an expression-type incompatibility.
+        # Diagnostic: emit both errors so any residual failure
+        # (e.g. a new Symbol that needs GlobalRef aliasing)
+        # surfaces the exception instead of disappearing into
+        # silent parse_failed counters. The five-round repair
+        # journey (f5af37dd → c81b6f59 → f8fce565 → 803b8ebd →
+        # THIS patch) would have been impossible without this
+        # instrumentation.
         @warn (
             "SeedPopulation: parse_seed_tree both raw and aliased " *
             "parses failed; falling back (seed dropped)"
-        ) seed_str raw_err aliased_err evaluate_on_n=length(evaluate_on)
+        ) seed_str raw_err aliased_err
         return nothing
     end
 end
@@ -350,34 +324,52 @@ end
 """
     _alias_pysr_safe_ops(x)
 
-Return a new AST with every `:log(...)` call head rewritten to
-`:safe_log` and every `:sqrt(...)` call head rewritten to
-`:safe_sqrt`. Pure / non-mutating; walks the Julia AST recursively.
+Return a new AST with every `:log(...)` / `:sqrt(...)` call head
+rewritten to a `GlobalRef` pointing at the corresponding safe-op
+function. Pure / non-mutating; walks the Julia AST recursively.
 
-Why this exists: PySR's `Options(unary_operators=["log", "sqrt"])`
-constructs an `OperatorEnum` whose actual callable symbols are the
-domain-safe wrappers (`SymbolicRegression.CoreModule.OperatorsModule.
-safe_log` / `safe_sqrt`) — a bare `log` / `sqrt` call in a seed
-string therefore fails `parse_expression`'s operator resolution with
-"Unrecognized operator: log with no matches in (safe_log, safe_sqrt)".
-Aliasing in the seed parser lets Python-emitted sympy strings
-(which never see the safe wrappers) resolve against a PySR-built
-enum. For non-PySR callers whose enum carries plain `log` / `sqrt`,
-the first-pass `parse_expression` in `parse_seed_tree` succeeds
-without ever reaching this function.
+Why `GlobalRef` and not bare Symbol: `DynamicExpressions.Parse`
+resolves an `Expr(:call, callee, args...)` callee by
+`Core.eval(EmptyModule, callee)` (see
+`DynamicExpressions/src/Parse.jl:265-269`). `EmptyModule` is a
+blank module with no top-level bindings, so a Symbol like `:log`
+or `:safe_log` CANNOT be resolved there regardless of what the
+calling module has imported, exported, or passed via
+`evaluate_on`. A `GlobalRef(Mod, :name)`, by contrast, is a
+direct binding reference — `Core.eval` returns the bound value
+without needing any scope lookup. Codex Lane D0.R
+task-mo6kbwnf-9081c9 (2026-04-20) verified this empirically on
+live PySR Options + Dataset: `max_abs_err = 5.96e-8` between the
+parsed-tree evaluation and the Python-computed target (machine
+epsilon for Float32).
 
-No-op on anything other than `:call` heads for `:log` / `:sqrt`.
-In particular, symbols like `:X1`, numeric literals, and nested
+The target module is `parentmodule(@__MODULE__)` (i.e.
+`SymbolicRegression` when this module is loaded inside the fork).
+Both `safe_log` and `safe_sqrt` are exported at the
+SymbolicRegression top level (see `src/SymbolicRegression.jl`
+export list), so `GlobalRef(SymbolicRegression, :safe_log)`
+resolves to the same function `Options(unary_operators=["log"])`
+wraps into the OperatorEnum.
+
+`:inv` is NOT aliased: PySR's `inv(x) = 1/x` is a user-defined
+binding that lives in Python-driven Main scope, not in
+SymbolicRegression exports. If a seed carrying `inv(...)` shows
+up in practice, the instrumented `@warn` surfaces the exact
+failure so we can add the right GlobalRef target then.
+
+No-op on anything other than `:call` heads for `:log` / `:sqrt`
+— symbols like `:X1`, numeric literals, and nested
 `log(log(X1))` forms are all handled correctly.
 """
 function _alias_pysr_safe_ops(x)
     if x isa Expr
         new_args = Any[_alias_pysr_safe_ops(a) for a in x.args]
         if x.head === :call && !isempty(new_args)
+            sr = parentmodule(@__MODULE__)
             if new_args[1] === :log
-                new_args[1] = :safe_log
+                new_args[1] = GlobalRef(sr, :safe_log)
             elseif new_args[1] === :sqrt
-                new_args[1] = :safe_sqrt
+                new_args[1] = GlobalRef(sr, :safe_sqrt)
             end
         end
         return Expr(x.head, new_args...)
