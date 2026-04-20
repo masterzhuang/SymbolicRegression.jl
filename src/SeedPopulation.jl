@@ -467,10 +467,22 @@ function splice_seeds_into_population!(
         tree = seed_trees[k]
         try
             # v1.11.3 dataset-aware convenience constructor computes
-            # cost + loss + birth internally via eval_cost. Does NOT
-            # accept a `deterministic` kwarg; determinism / ref bump is
-            # handled via the `parent=-1` sentinel (no parent lineage).
-            member = PopMember(dataset, tree, options; parent = -1)
+            # cost + loss + birth internally via eval_cost. It
+            # REQUIRES explicit `deterministic` and `parent` kwargs —
+            # the docstring previously said `parent=-1` sentinel was
+            # enough, but Codex Lane D0.8 task-mo6t6o39-69atf2
+            # (2026-04-20) captured the PopMember MethodError:
+            #   ArgumentError: You must declare `deterministic` as
+            #   `true` or `false`, it cannot be left undefined.
+            # Forward options.deterministic verbatim so the seeded
+            # slots match the same reproducibility contract as the
+            # rest of the population that PySR's standard
+            # initialization builds.
+            member = PopMember(
+                dataset, tree, options;
+                parent        = -1,
+                deterministic = options.deterministic,
+            )
             pop.members[k] = member
             spliced += 1
         catch build_err
