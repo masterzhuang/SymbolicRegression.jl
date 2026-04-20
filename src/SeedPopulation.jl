@@ -275,26 +275,41 @@ function parse_seed_tree(
     catch
         return nothing
     end
-    # Force node_type's T parameter to match the Dataset's T so the
+    # Match node_type's T to Dataset's T for the default-stack case
+    # (PySR's `options.node_type === Node`, unparameterized) so the
     # returned Expression can be spliced into a PopMember without a
-    # MethodError.
+    # MethodError. For non-default expression stacks
+    # (`ParametricExpression`, `TemplateExpression`, `GraphNode`, or
+    # any user-registered `AbstractExpressionNode` subtype),
+    # `options.node_type` is forwarded through unchanged — the
+    # original v1.11.3 upstream contract is preserved for those
+    # callers (see module docstring about upstream-compatibility).
     #
-    # PySR's `options.node_type` is typically the unparameterized
-    # `Node` (parse_expression fills in Node{Float32} by default),
-    # but PySR's Dataset is Float64 from numpy inputs. PopMember
-    # requires Dataset{T, L} and AbstractExpression{T} to share the
-    # SAME T — with Dataset{Float64} and Expression{Float32} we get
-    # `MethodError: no method matching PopMember(...)` and the seed
-    # gets dropped with build_failed incrementing. Codex Lane D0.7
-    # `task-mo6ryvel-dc0zb8` (2026-04-20) captured this exact
-    # MethodError via the `@warn` in splice_seeds_into_population!.
+    # Why this matters: PySR's default stack sets
+    # `options.node_type = Node` (the base unparameterized type).
+    # `parse_expression` then fills in `Node{Float32}` by default,
+    # producing `Expression{Float32, Node{Float32}, ...}`. But
+    # PySR's Dataset is Float64 from numpy inputs, so
+    # `PopMember(::Dataset{T, L}, ::AbstractExpression{T}, ::Options)
+    # where {T, L}` has no method for `Dataset{Float64}` +
+    # `Expression{Float32}` — MethodError → caught silently as
+    # build_failed. Codex Lane D0.7 `task-mo6ryvel-dc0zb8`
+    # (2026-04-20) captured this exact MethodError via the @warn in
+    # splice_seeds_into_population!.
     #
-    # The D0.R probe missed this because it reused an exemplar tree
-    # from `state[2].members[1].tree` whose T happened to match the
-    # probe's ad-hoc dataset — i.e., D0.R verified the parse path
-    # itself, not the Dataset↔Expression T-matching requirement that
-    # PopMember enforces downstream.
-    matched_node_type = Node{T}
+    # For non-default stacks the user has opted into a specific
+    # node_type (e.g. `ParametricNode`) whose T is already decided
+    # by the user; overriding it to `Node{T}` would regress
+    # expression-type compatibility (flagged by
+    # PR #221 stop-review). Only override when the default base
+    # `Node` is detected.
+    #
+    # The D0.R probe missed the T-mismatch altogether because it
+    # reused an exemplar tree from `state[2].members[1].tree` whose
+    # T happened to match the probe's ad-hoc dataset — i.e., D0.R
+    # verified the parse path itself, not the Dataset↔Expression
+    # T-matching requirement that PopMember enforces downstream.
+    matched_node_type = options.node_type === Node ? Node{T} : options.node_type
 
     # First pass: try the raw AST so non-PySR callers whose
     # OperatorEnum carries plain `log` / `sqrt` (whose bare
