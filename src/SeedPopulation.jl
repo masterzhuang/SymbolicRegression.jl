@@ -278,11 +278,18 @@ function parse_seed_tree(
     evaluate_on = try
         ops = options.operators
         # ops.unaops / ops.binops are function tuples on
-        # DynamicExpressions.OperatorEnum. Concat both so the evaluator
-        # has every registered op available.
-        (ops.binops..., ops.unaops...)
+        # DynamicExpressions.OperatorEnum. Concat both into a
+        # `Vector` so the evaluator has every registered op
+        # available. `parse_expression` enforces
+        # `evaluate_on::Union{Nothing, AbstractVector}` and rejects
+        # a bare `Tuple` with `TypeError: in keyword argument
+        # evaluate_on, expected Union{Nothing, AbstractVector},
+        # got a value of type Tuple{...}` — Codex Lane D0.4
+        # task-mo6fn1a6-5w6h01 (2026-04-20) reproduced this exact
+        # type error on the first evaluate_on attempt.
+        Any[ops.binops..., ops.unaops...]
     catch
-        ()
+        Any[]
     end
     # First pass: try the raw AST so non-PySR callers whose OperatorEnum
     # carries plain `log` / `sqrt` continue to parse bit-identically.
