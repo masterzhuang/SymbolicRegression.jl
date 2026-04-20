@@ -27,7 +27,7 @@ using ..PopMemberModule: PopMember
 using ..PopulationModule: Population
 using ..LossFunctionsModule: eval_cost
 using DynamicExpressions:
-    AbstractExpression, AbstractExpressionNode, Node, parse_expression
+    AbstractExpression, AbstractExpressionNode, Node, parse_expression, get_tree
 import JSON3
 
 # Rationale for the `using ..CoreModule.OperatorsModule: safe_log,
@@ -316,15 +316,35 @@ function parse_seed_tree(
     # Symbol callees happen to resolve in EmptyModule because
     # they map to Base functions) continue to parse bit-
     # identically with upstream.
+    #
+    # We UNWRAP the resulting `Expression{T, Node{T}, NT_...}` back
+    # to its inner `Node{T}` via `get_tree(...)` and return that
+    # bare tree. Rationale: PopMember's signature accepts
+    # `Union{AbstractExpressionNode{T}, AbstractExpression{T}}`, but
+    # PySR's Population stores members as
+    # `PopMember{T, L, Expression{T, Node{T}, NamedTuple{(ops, vn),
+    # Tuple{Nothing, Nothing}}}}` — Population sets metadata to
+    # (nothing, nothing) because operators + variable_names live on
+    # `options`, not per-expression. `parse_expression` builds the
+    # Expression with metadata populated from its kwargs, producing
+    # `NamedTuple{..., Tuple{OperatorEnum{...}, Vector{String}}}`
+    # metadata. That parameterisation doesn't convert to the
+    # Population's member type → MethodError at the
+    # `pop.members[k] = member` assignment. Codex Lane D0.9b
+    # task-mo6vb0wu-812ugp (2026-04-20) captured this exact
+    # MethodError via the 304205a2 splice @warn. Returning the bare
+    # Node lets PopMember wrap it with default (Nothing, Nothing)
+    # metadata that matches the Population's member type.
     raw_err = nothing
     try
-        return parse_expression(
+        expr = parse_expression(
             ast_expr;
             operators       = options.operators,
             variable_names  = varnames,
             expression_type = options.expression_type,
             node_type       = matched_node_type,
         )
+        return get_tree(expr)
     catch err_raw
         raw_err = err_raw
     end
@@ -334,13 +354,14 @@ function parse_seed_tree(
     # verification (max_abs_err 5.96e-8 on live PySR opts).
     aliased = _alias_pysr_safe_ops(ast_expr)
     try
-        return parse_expression(
+        expr = parse_expression(
             aliased;
             operators       = options.operators,
             variable_names  = varnames,
             expression_type = options.expression_type,
             node_type       = matched_node_type,
         )
+        return get_tree(expr)
     catch aliased_err
         # Diagnostic: emit both errors so any residual failure
         # (e.g. a new Symbol that needs GlobalRef aliasing)
