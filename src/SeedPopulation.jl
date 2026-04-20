@@ -425,6 +425,8 @@ function splice_seeds_into_population!(
     n = min(length(seed_trees), length(pop.members))
     spliced = 0
     build_failed = 0
+    first_build_err = nothing
+    first_build_err_tree_type = nothing
     for k in 1:n
         tree = seed_trees[k]
         try
@@ -435,9 +437,26 @@ function splice_seeds_into_population!(
             member = PopMember(dataset, tree, options; parent = -1)
             pop.members[k] = member
             spliced += 1
-        catch
+        catch build_err
             build_failed += 1
+            if first_build_err === nothing
+                first_build_err = build_err
+                first_build_err_tree_type = typeof(tree)
+            end
         end
+    end
+    # Codex Lane D0.6b (ASOUL-SR task-mo6pe2xe-ej59eh, 2026-04-20):
+    # the GlobalRef parse fix landed (parsed_ok=2 per dataset) but
+    # PopMember construction failed silently with build_failed=2 on
+    # every dataset. Logging the first caught exception surfaces the
+    # concrete cause (likely check_constraints / eval_cost domain /
+    # node_type mismatch) so the next repair round is one-shot again
+    # instead of blind.
+    if build_failed > 0 && first_build_err !== nothing
+        @warn (
+            "SeedPopulation: PopMember construction failed for at " *
+            "least one parsed seed — falling back to random for those slots"
+        ) n_attempts=n spliced build_failed tree_type=first_build_err_tree_type err=first_build_err
     end
     return (spliced, build_failed)
 end
