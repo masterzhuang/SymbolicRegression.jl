@@ -275,6 +275,27 @@ function parse_seed_tree(
     catch
         return nothing
     end
+    # Force node_type's T parameter to match the Dataset's T so the
+    # returned Expression can be spliced into a PopMember without a
+    # MethodError.
+    #
+    # PySR's `options.node_type` is typically the unparameterized
+    # `Node` (parse_expression fills in Node{Float32} by default),
+    # but PySR's Dataset is Float64 from numpy inputs. PopMember
+    # requires Dataset{T, L} and AbstractExpression{T} to share the
+    # SAME T — with Dataset{Float64} and Expression{Float32} we get
+    # `MethodError: no method matching PopMember(...)` and the seed
+    # gets dropped with build_failed incrementing. Codex Lane D0.7
+    # `task-mo6ryvel-dc0zb8` (2026-04-20) captured this exact
+    # MethodError via the `@warn` in splice_seeds_into_population!.
+    #
+    # The D0.R probe missed this because it reused an exemplar tree
+    # from `state[2].members[1].tree` whose T happened to match the
+    # probe's ad-hoc dataset — i.e., D0.R verified the parse path
+    # itself, not the Dataset↔Expression T-matching requirement that
+    # PopMember enforces downstream.
+    matched_node_type = Node{T}
+
     # First pass: try the raw AST so non-PySR callers whose
     # OperatorEnum carries plain `log` / `sqrt` (whose bare
     # Symbol callees happen to resolve in EmptyModule because
@@ -287,7 +308,7 @@ function parse_seed_tree(
             operators       = options.operators,
             variable_names  = varnames,
             expression_type = options.expression_type,
-            node_type       = options.node_type,
+            node_type       = matched_node_type,
         )
     catch err_raw
         raw_err = err_raw
@@ -303,7 +324,7 @@ function parse_seed_tree(
             operators       = options.operators,
             variable_names  = varnames,
             expression_type = options.expression_type,
-            node_type       = options.node_type,
+            node_type       = matched_node_type,
         )
     catch aliased_err
         # Diagnostic: emit both errors so any residual failure
